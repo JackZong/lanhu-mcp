@@ -267,3 +267,84 @@ def test_csrf_rejection_and_explicit_denial(http, provider):
     assert r.status_code == 303
     assert parse_qs(urlsplit(r.headers["location"]).query) == {"error": ["access_denied"], "state": ["deny-state"]}
     assert provider.store.get("pending", tx) is None
+
+
+@pytest.mark.asyncio
+async def test_browser_form_preserves_origin(http, provider):
+    import asyncio
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from playwright.async_api import async_playwright, Error
+
+    cid = register(http)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(b"a" * 64).digest()).decode().rstrip("=")
+    response = http.get(
+        "/authorize",
+        params={
+            "client_id": cid,
+            "redirect_uri": "http://127.0.0.1:19876/callback",
+            "response_type": "code",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "scope": "lanhu",
+        },
+    )
+    login_url = response.headers["location"]
+    rendered = http.get(login_url)
+    assert rendered.headers["referrer-policy"] == "same-origin"
+    async with async_playwright() as p:
+        try:
+            browser = await p.chromium.launch()
+        except Error as exc:
+            if "Executable doesn't exist" in str(exc):
+                pytest.skip("Chromium is not installed")
+            raise
+        try:
+
+            class CallbackHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"Returned to MCP client")
+
+                def log_message(self, *args):
+                    pass
+
+            callback_server = ThreadingHTTPServer(("127.0.0.1", 19876), CallbackHandler)
+            callback_thread = threading.Thread(target=callback_server.serve_forever, daemon=True)
+            callback_thread.start()
+            page = await browser.new_page()
+            submitted = asyncio.get_running_loop().create_future()
+
+            async def route_request(route):
+                if route.request.method == "GET":
+                    await route.fulfill(status=200, headers=dict(rendered.headers), body=rendered.text)
+                else:
+                    headers = await route.request.all_headers()
+                    result = http.post(
+                        "/login",
+                        content=route.request.post_data,
+                        headers={
+                            "Origin": headers.get("origin", ""),
+                            "Content-Type": headers["content-type"],
+                            "Cookie": headers.get("cookie", ""),
+                        },
+                    )
+                    submitted.set_result((headers, result))
+                    await route.fulfill(status=result.status_code, headers=dict(result.headers), body=result.content)
+
+            await page.route("**/login*", route_request)
+            await page.goto(login_url)
+            await page.get_by_role("button", name="取消授权").click()
+            headers, result = await asyncio.wait_for(submitted, timeout=10)
+            await page.wait_for_url("http://127.0.0.1:19876/callback*", timeout=5000)
+            assert headers["origin"] == provider.public_url
+            assert "lanhu_csrf=" in headers["cookie"]
+            assert result.status_code == 303, result.text
+            assert parse_qs(urlsplit(result.headers["location"]).query)["error"] == ["access_denied"]
+        finally:
+            await browser.close()
+            if "callback_server" in locals():
+                callback_server.shutdown()
+                callback_server.server_close()
+                callback_thread.join(timeout=5)
