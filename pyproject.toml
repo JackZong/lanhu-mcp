@@ -49,6 +49,7 @@ dependencies = [
     "pillow>=10.4.0",
     "python-dotenv>=1.0.0",
     "htmlmin2>=0.1.12",
+    "cryptography>=45.0.1",
 ]
 
 [project.optional-dependencies]
@@ -84,7 +85,7 @@ version = {attr = "lanhu_design.__version__"}
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["lanhu_mcp_server*", "lanhu_design*"]
+include = ["lanhu_mcp_server*", "lanhu_design*", "lanhu_auth*"]
 
 [tool.black]
 line-length = 120

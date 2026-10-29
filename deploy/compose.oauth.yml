@@ -1,0 +1,32 @@
+services:
+  lanhu-mcp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple
+        APT_MIRROR: https://mirrors.aliyun.com
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LANHU_AUTH_ENABLED: 'true'
+      LANHU_PUBLIC_URL: https://lanhu.mcp.paxcq.com
+      DATA_DIR: /app/data
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: '8000'
+    ports:
+      - '127.0.0.1:5188:8000'
+    volumes:
+      - ../data:/app/data
+    shm_size: 512mb
+    init: true
+    healthcheck:
+      test: ['CMD', 'python', '-c', 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:8000/healthz")']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'

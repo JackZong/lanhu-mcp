@@ -7,3 +7,4 @@ lxml>=5.0.0
 python-dotenv>=1.0.0
 htmlmin2>=0.1.12
 pillow>=10.4.0
+cryptography>=45.0.1

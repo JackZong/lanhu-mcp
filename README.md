@@ -831,6 +831,14 @@ lanhu-mcp-server/
     └── *.log                     # 运行日志
 ```
 
+## 🌐 多用户服务器登录授权
+
+服务器地址：`https://lanhu.mcp.paxcq.com/mcp`。支持远程 MCP OAuth 的客户端在添加地址后会打开网页，用户登录自己的蓝湖账号并确认授权，然后返回客户端。无需向 AI 提供账号密码、Cookie 或手工复制访问令牌。
+
+部署时启用 `LANHU_AUTH_ENABLED=true`，设置公开 HTTPS 地址及独立加密密钥。每位用户的蓝湖会话、元数据缓存和资源目录独立保存；密码仅用于即时验证，不持久保存。本地 stdio 和已有的单账号 Cookie 模式默认保持不变。
+
+完整配置、Docker Compose、HTTPS 代理与登录方式限制见 [多用户 OAuth 部署指南](deploy/README.md)。
+
 ## 🔧 高级配置
 
 ### 自定义角色映射

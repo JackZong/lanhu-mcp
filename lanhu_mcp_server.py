@@ -550,7 +550,16 @@ from mcp.types import TextContent
 from playwright.async_api import async_playwright
 
 # 创建FastMCP服务器
-mcp = FastMCP("Lanhu Axure Extractor")
+_oauth_provider = None
+if os.getenv("LANHU_AUTH_ENABLED", "").lower() in ("1", "true", "yes"):
+    from lanhu_auth import LanhuOAuthProvider
+    auth_root = Path(os.environ.get("DATA_DIR", "./data")).expanduser()
+    if not auth_root.is_absolute():
+        auth_root = ((env_path.parent if env_path.is_file() else Path(__file__).resolve().parent) / auth_root).resolve()
+    _oauth_provider = LanhuOAuthProvider(
+        os.environ["LANHU_PUBLIC_URL"], auth_root, os.environ["LANHU_AUTH_KEY"]
+    )
+mcp = FastMCP("Lanhu Axure Extractor", auth=_oauth_provider)
 
 # 全局配置
 DEFAULT_COOKIE = "your_lanhu_cookie_here"  # 请替换为你的蓝湖Cookie，从浏览器开发者工具中获取
@@ -576,6 +585,34 @@ else:
     data_dir_base = env_path.parent if env_path.is_file() else Path(__file__).resolve().parent
     DATA_DIR = (data_dir_base / data_dir_value).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+def _current_cookie(dds=False):
+    if _oauth_provider is not None:
+        return _oauth_provider.session()[1]["cookie"]
+    return DDS_COOKIE if dds else COOKIE
+
+
+def _current_data_dir():
+    if _oauth_provider is None:
+        return DATA_DIR
+    subject, _ = _oauth_provider.session()
+    directory = DATA_DIR / "users" / hashlib.sha256(subject.encode()).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+
+def _validate_storage_id(value):
+    if value is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(value)):
+        raise ValueError("Invalid project or document identifier")
+    return value
+
+
+def _tenant_cache_key(key):
+    if _oauth_provider is None:
+        return key
+    return (_oauth_provider.session()[0], key)
+
 
 # HTTP 请求超时时间（秒）
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
@@ -2321,6 +2358,7 @@ def _get_cached_metadata(cache_key: str, version_id: str = None) -> Optional[dic
     Returns:
         缓存的元数据，如果未命中或版本不匹配则返回None
     """
+    cache_key = _tenant_cache_key(cache_key)
     if cache_key in _metadata_cache:
         cache_entry = _metadata_cache[cache_key]
         
@@ -2348,6 +2386,7 @@ def _set_cached_metadata(cache_key: str, metadata: dict, version_id: str = None)
         metadata: 元数据
         version_id: 文档版本ID，存储后只要版本不变就永久有效
     """
+    cache_key = _tenant_cache_key(cache_key)
     _metadata_cache[cache_key] = {
         'data': metadata.copy(),
         'version_id': version_id  # 版本号作为缓存有效性标识
@@ -2526,8 +2565,8 @@ class MessageStore:
         Args:
             project_id: 项目ID，如果为None则用于全局操作模式
         """
-        self.project_id = project_id
-        self.storage_dir = DATA_DIR / "messages"
+        self.project_id = _validate_storage_id(project_id)
+        self.storage_dir = _current_data_dir() / "messages"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         
         if project_id:
@@ -3028,7 +3067,7 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Referer": "https://lanhuapp.com/web/",
             "Accept": "application/json, text/plain, */*",
-            "Cookie": COOKIE,
+            "Cookie": _current_cookie(),
             "sec-ch-ua": '"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": '"macOS"',
@@ -3085,6 +3124,9 @@ class LanhuExtractor:
         # pageId 跨文档版本保持稳定：文档被替换后 docId/versionId 会变，
         # 但 pageId 仍能在新文档的 sitemap 中命中，可用于兜底消歧
         page_id = params.get('pageId')
+
+        for identifier in (project_id, doc_id, team_id, version_id, page_id):
+            _validate_storage_id(identifier)
 
         # 验证必需参数（pid 是唯一必需的，tid 可选 — detailDetach 等格式不含 tid）
         if not project_id:
@@ -4246,7 +4288,7 @@ class LanhuExtractor:
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://dds.lanhuapp.com/",
-            "Cookie": DDS_COOKIE,
+            "Cookie": _current_cookie(dds=True),
             "Authorization": "Basic dW5kZWZpbmVkOg==",
         }
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=dds_headers, follow_redirects=True) as dds_client:
@@ -5571,9 +5613,13 @@ async def lanhu_resolve_invite_link(
         Resolved URL and parsed parameters
     """
     try:
+        if _oauth_provider is not None:
+            parsed_invite = urlparse(invite_url)
+            if parsed_invite.scheme != "https" or parsed_invite.hostname not in ("lanhuapp.com", "www.lanhuapp.com"):
+                raise ValueError("Use an HTTPS Lanhu invite URL")
         # 解析Cookie字符串为playwright格式
         cookies = []
-        for cookie_str in COOKIE.split('; '):
+        for cookie_str in _current_cookie().split('; '):
             if '=' in cookie_str:
                 name, value = cookie_str.split('=', 1)
                 cookies.append({
@@ -6426,8 +6472,8 @@ async def lanhu_get_ai_analyze_page_result(
         doc_id = params['doc_id']
 
         # 设置输出目录（内部实现，自动管理）
-        resource_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}")
-        output_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}_screenshots")
+        resource_dir = str(_current_data_dir() / f"axure_extract_{doc_id[:8]}")
+        output_dir = str(_current_data_dir() / f"axure_extract_{doc_id[:8]}_screenshots")
 
         # 下载资源（支持智能缓存）
         download_result = await extractor.download_resources(url, resource_dir)
@@ -6743,9 +6789,9 @@ async def lanhu_inspect_requirement_region(
 
         params = extractor.parse_url(url)
         doc_id = params["doc_id"]
-        resource_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}")
-        screenshot_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}_screenshots")
-        region_dir = str(DATA_DIR / f"axure_extract_{doc_id[:8]}_regions")
+        resource_dir = str(_current_data_dir() / f"axure_extract_{doc_id[:8]}")
+        screenshot_dir = str(_current_data_dir() / f"axure_extract_{doc_id[:8]}_screenshots")
+        region_dir = str(_current_data_dir() / f"axure_extract_{doc_id[:8]}_regions")
         download_result = await extractor.download_resources(url, resource_dir)
         if download_result["status"] in ["downloaded", "updated"]:
             fix_html_files(resource_dir)
@@ -7156,7 +7202,7 @@ async def lanhu_get_ai_analyze_design_result(
                 f"⚠️ No matching design found\n\nAvailable designs:\n" + "\n".join(f"  • {name}" for name in available_names)]
 
         # 设置输出目录（内部实现，自动管理）
-        output_dir = DATA_DIR / 'lanhu_designs' / params['project_id']
+        output_dir = _current_data_dir() / 'lanhu_designs' / params['project_id']
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # 下载设计图并生成HTML
@@ -8222,8 +8268,17 @@ except ModuleNotFoundError as exc:
 
 _design_service = (
     DesignService(DATA_DIR / "design_context", COOKIE, DDS_COOKIE, HTTP_TIMEOUT)
-    if DesignService is not None else None
+    if DesignService is not None and _oauth_provider is None else None
 )
+
+
+
+def _current_design_service():
+    if _oauth_provider is None or DesignService is None:
+        return _design_service
+    # Service loads artifacts from its root; never share a mutable cookie/service between users.
+    return DesignService(_current_data_dir() / "design_context", _current_cookie(),
+                         _current_cookie(dds=True), HTTP_TIMEOUT)
 
 
 def _design_failure(exc: Exception) -> dict:
@@ -8256,6 +8311,7 @@ async def lanhu_get_design_overview(
     classification is performed. All later calls use the returned snapshot_id.
     """
     try:
+        _design_service = _current_design_service()
         if _design_service is None:
             raise DesignError("DesignModulesMissing", "Install the full package to use design tools; requirement tools remain available.")
         prepared = await _design_service.prepare(url, design_id, version_id)
@@ -8282,6 +8338,7 @@ async def lanhu_inspect_design_region(
     Choose assets by visual evidence and IDs; names need not be meaningful.
     """
     try:
+        _design_service = _current_design_service()
         if _design_service is None:
             raise DesignError("DesignModulesMissing", "Install the full package to use design tools; requirement tools remain available.")
         if not region and not node_ids:
@@ -8308,6 +8365,7 @@ async def lanhu_export_design_assets(
     into its project. A server cache path is not a client path. Partial exports list failures.
     """
     try:
+        _design_service = _current_design_service()
         if _design_service is None:
             raise DesignError("DesignModulesMissing", "Install the full package to use design tools; requirement tools remain available.")
         return await _design_service.export(snapshot_id, asset_ids, kind, target_dpr, format_preference)
@@ -8318,6 +8376,7 @@ async def lanhu_export_design_assets(
 @mcp.resource("lanhu://design/{snapshot_id}/preview/{preview_id}", mime_type="image/png")
 def lanhu_design_preview(snapshot_id: str, preview_id: str) -> bytes:
     """The exact crop generated by a visual design query."""
+    _design_service = _current_design_service()
     if _design_service is None:
         raise DesignError("DesignModulesMissing", "Install the full package to use design resources.")
     return _design_service.artifact(snapshot_id, "preview", preview_id)
@@ -8326,6 +8385,7 @@ def lanhu_design_preview(snapshot_id: str, preview_id: str) -> bytes:
 @mcp.resource("lanhu://design/{snapshot_id}/bundle/{bundle_id}", mime_type="application/zip")
 def lanhu_design_bundle(snapshot_id: str, bundle_id: str) -> bytes:
     """Verified original assets and their portable manifest; install on the client."""
+    _design_service = _current_design_service()
     if _design_service is None:
         raise DesignError("DesignModulesMissing", "Install the full package to use design resources.")
     return _design_service.artifact(snapshot_id, "bundle", bundle_id)
@@ -8357,7 +8417,7 @@ def main():
         print("    }")
         print("  }")
         print("}\n")
-        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT)
+        mcp.run(transport="http", path="/mcp", host=SERVER_HOST, port=SERVER_PORT, stateless_http=(_oauth_provider is not None))
 
 
 if __name__ == "__main__":
