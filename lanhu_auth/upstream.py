@@ -53,9 +53,13 @@ async def login(account: str, password: str) -> dict:
                 raise LoginError("蓝湖要求安全验证，请先在蓝湖官网完成验证后重试。")
             raise LoginError("蓝湖登录失败，请检查账号密码或在蓝湖官网确认账号状态。")
         data = body.get("data") or {}
-        if data.get("auth_mobile"):
-            raise LoginError("蓝湖要求绑定或验证手机号，请先在官网完成后重试。")
+        # auth_mobile controls a frontend prompt (the official UI has skip/session
+        # branches). It does not itself mean the issued ticket is invalid. Let
+        # Lanhu's session exchange and authenticated identity endpoint decide.
+        mobile_prompt = bool(data.get("auth_mobile"))
         if not data.get("ticket"):
+            if mobile_prompt:
+                raise LoginError("蓝湖未签发登录票据，请先在官网完成手机号验证后重试。")
             raise LoginError("蓝湖未返回登录票据，请重试。")
         response = await client.get(
             "https://lanhuapp.com/api/auth",
@@ -86,12 +90,18 @@ async def login(account: str, password: str) -> dict:
             if c.domain.lstrip(".") in ("lanhuapp.com", "www.lanhuapp.com")
         )
         if not cookie:
+            if mobile_prompt:
+                raise LoginError("蓝湖未签发会话，请先在官网完成手机号验证后重试。")
             raise LoginError("蓝湖未签发会话，请重试。")
         response = await client.get("https://lanhuapp.com/api/account/entry", headers={"Cookie": cookie})
+        if response.status_code in (401, 403) and mobile_prompt:
+            raise LoginError("蓝湖尚未允许访问账号，请在官网完成所需验证后重试。")
         response.raise_for_status()
         profile = response.json()
         user = profile.get("data") or profile.get("result") or {}
         uid = user.get("id") or user.get("user_id")
         if str(profile.get("code")) not in ("0", "00000") or not uid:
+            if mobile_prompt:
+                raise LoginError("蓝湖尚未允许访问账号，请在官网完成所需验证后重试。")
             raise LoginError("无法验证蓝湖用户身份，请重试。")
         return {"subject": str(uid), "cookie": cookie, "name": str(user.get("name") or user.get("username") or account)}

@@ -160,7 +160,8 @@ def test_encrypted_persistence_and_expiry(provider):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("via_redirect", [False, True])
-async def test_lanhu_sso_protocol_encryption_and_cookie_exchange(monkeypatch, via_redirect):
+@pytest.mark.parametrize("auth_mobile", [False, True])
+async def test_lanhu_sso_protocol_encryption_and_cookie_exchange(monkeypatch, via_redirect, auth_mobile):
     import httpx
     from lanhu_auth import upstream
 
@@ -176,7 +177,9 @@ async def test_lanhu_sso_protocol_encryption_and_cookie_exchange(monkeypatch, vi
             assert payload["mobile_or_email"] == "alice@example.com"
             assert payload["password"] != "plain-password"
             assert len(base64.b64decode(payload["password"])) == 256
-            return httpx.Response(200, json={"code": 0, "data": {"ticket": "one-time-ticket"}})
+            return httpx.Response(
+                200, json={"code": 0, "data": {"ticket": "one-time-ticket", "auth_mobile": auth_mobile}}
+            )
         if request.url.path == "/api/auth":
             if via_redirect:
                 return httpx.Response(
@@ -348,3 +351,34 @@ async def test_browser_form_preserves_origin(http, provider):
                 callback_server.shutdown()
                 callback_server.server_close()
                 callback_thread.join(timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["no_ticket", "no_session", "identity_denied", "http_denied"])
+async def test_mobile_prompt_never_bypasses_upstream_authentication(monkeypatch, failure):
+    import httpx
+    from lanhu_auth import upstream
+
+    real_client = httpx.AsyncClient
+
+    def handler(request):
+        if request.url.path == "/api/passport/login":
+            data = {"auth_mobile": True}
+            if failure != "no_ticket":
+                data["ticket"] = "upstream-issued-ticket"
+            return httpx.Response(200, json={"code": 0, "data": data})
+        if request.url.path == "/api/auth":
+            headers = {"location": "https://lanhuapp.com/dashboard/"}
+            if failure != "no_session":
+                headers["set-cookie"] = "user_token=upstream-session; Domain=.lanhuapp.com; Path=/"
+            return httpx.Response(302, headers=headers)
+        assert request.url.path == "/api/account/entry"
+        if failure == "http_denied":
+            return httpx.Response(403)
+        return httpx.Response(200, json={"code": 30001, "data": {}})
+
+    monkeypatch.setattr(
+        upstream.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)
+    )
+    with pytest.raises(upstream.LoginError):
+        await upstream.login("alice@example.com", "test-password")
