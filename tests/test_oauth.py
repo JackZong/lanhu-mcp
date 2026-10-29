@@ -161,7 +161,10 @@ def test_encrypted_persistence_and_expiry(provider):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("via_redirect", [False, True])
 @pytest.mark.parametrize("auth_mobile", [False, True])
-async def test_lanhu_sso_protocol_encryption_and_cookie_exchange(monkeypatch, via_redirect, auth_mobile):
+@pytest.mark.parametrize("identity_shape", ["raw", "data", "result"])
+async def test_lanhu_sso_protocol_encryption_and_cookie_exchange(
+    monkeypatch, via_redirect, auth_mobile, identity_shape
+):
     import httpx
     from lanhu_auth import upstream
 
@@ -195,7 +198,11 @@ async def test_lanhu_sso_protocol_encryption_and_cookie_exchange(monkeypatch, vi
             )
         assert request.url.path == "/api/account/entry"
         assert request.headers["cookie"] == "user_token=lanhu-secret"
-        return httpx.Response(200, json={"code": "00000", "data": {"id": "alice-id", "name": "Alice"}})
+        identity = {"id": "alice-id", "name": "Alice"}
+        if identity_shape == "raw":
+            # Production /api/account/entry has no code/data envelope.
+            return httpx.Response(200, json=identity)
+        return httpx.Response(200, json={"code": "00000", identity_shape: identity})
 
     monkeypatch.setattr(
         upstream.httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw)
@@ -354,7 +361,9 @@ async def test_browser_form_preserves_origin(http, provider):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["no_ticket", "no_session", "identity_denied", "http_denied"])
+@pytest.mark.parametrize(
+    "failure", ["no_ticket", "no_session", "identity_denied", "http_denied", "error_with_id", "missing_id"]
+)
 async def test_mobile_prompt_never_bypasses_upstream_authentication(monkeypatch, failure):
     import httpx
     from lanhu_auth import upstream
@@ -375,6 +384,10 @@ async def test_mobile_prompt_never_bypasses_upstream_authentication(monkeypatch,
         assert request.url.path == "/api/account/entry"
         if failure == "http_denied":
             return httpx.Response(403)
+        if failure == "error_with_id":
+            return httpx.Response(200, json={"code": 30001, "id": "not-authorized"})
+        if failure == "missing_id":
+            return httpx.Response(200, json={"name": "No identity"})
         return httpx.Response(200, json={"code": 30001, "data": {}})
 
     monkeypatch.setattr(

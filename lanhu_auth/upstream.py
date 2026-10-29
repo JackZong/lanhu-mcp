@@ -94,14 +94,21 @@ async def login(account: str, password: str) -> dict:
                 raise LoginError("蓝湖未签发会话，请先在官网完成手机号验证后重试。")
             raise LoginError("蓝湖未签发会话，请重试。")
         response = await client.get("https://lanhuapp.com/api/account/entry", headers={"Cookie": cookie})
-        if response.status_code in (401, 403) and mobile_prompt:
-            raise LoginError("蓝湖尚未允许访问账号，请在官网完成所需验证后重试。")
+        if response.status_code in (401, 403):
+            raise LoginError(f"蓝湖身份接口拒绝了请求（HTTP {response.status_code}），请重新登录。")
         response.raise_for_status()
         profile = response.json()
-        user = profile.get("data") or profile.get("result") or {}
+        if not isinstance(profile, dict):
+            raise LoginError("蓝湖身份接口返回格式异常，请稍后重试。")
+        # /account/entry returns the user object directly in production. Other
+        # Lanhu endpoints/deployments wrap it in data/result; the official
+        # dashboard's transformResponse supports both shapes as well.
+        code = profile.get("code")
+        user = profile.get("data") or profile.get("result") or profile
+        if not isinstance(user, dict):
+            raise LoginError("蓝湖身份接口未返回用户信息，请重新登录。")
         uid = user.get("id") or user.get("user_id")
-        if str(profile.get("code")) not in ("0", "00000") or not uid:
-            if mobile_prompt:
-                raise LoginError("蓝湖尚未允许访问账号，请在官网完成所需验证后重试。")
-            raise LoginError("无法验证蓝湖用户身份，请重试。")
+        success_code = code is None or str(code) in ("0", "00000", "ok")
+        if not success_code or not isinstance(uid, (str, int)) or isinstance(uid, bool) or not uid:
+            raise LoginError("蓝湖身份验证未通过，请重新登录后重试。")
         return {"subject": str(uid), "cookie": cookie, "name": str(user.get("name") or user.get("username") or account)}
