@@ -32,3 +32,9 @@
 终止授权可通过 OAuth `/revoke` 撤销相应令牌；清空授权数据库或更换密钥会使全部授权失效。
 
 当前不提供蓝湖扫码/短信交互，也不实现 OAuth client ID metadata URL；采用动态客户端注册。上线需使用真实蓝湖账号完成一次端到端验证，自动测试使用模拟蓝湖响应，避免对真实账号发起登录操作。
+
+## Cursor 登录后提示 CSP form-action 拦截
+
+若浏览器控制台出现 `Sending form data ... violates ... form-action`，这是授权网页的导航被浏览器拦截，不能据此判断蓝湖账号或密码错误。Chromium 会检查表单提交后的整条 HTTP 重定向链；即使已允许客户端回调域名，客户端后续跨域跳转仍可能触发拦截。
+
+登录与取消授权均先返回本站中转页，再自动导航至经过校验的客户端回调地址，并提供手动返回链接。上传更新后的源码，执行 `docker compose -f deploy/compose.oauth.yml up -d --build`，然后从 Cursor 重新发起连接，使用新的授权页面。无需关闭浏览器 CSP。

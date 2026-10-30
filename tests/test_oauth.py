@@ -5,6 +5,7 @@ import hashlib
 from urllib.parse import urlsplit, parse_qs
 
 import pytest
+from bs4 import BeautifulSoup
 from cryptography.fernet import Fernet
 from fastmcp import FastMCP
 from starlette.testclient import TestClient
@@ -46,6 +47,15 @@ def register(http):
     return r.json()["client_id"]
 
 
+def callback_destination(response):
+    assert response.status_code == 200, response.text
+    document = BeautifulSoup(response.text, "html.parser")
+    destination = document.find("a")["href"]
+    assert document.find("meta", attrs={"http-equiv": "refresh"})["content"] == "0;url=" + destination
+    assert response.headers["cache-control"] == "no-store"
+    return destination
+
+
 def authorize(http, client_id, account="alice"):
     verifier = "a" * 64
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
@@ -69,8 +79,7 @@ def authorize(http, client_id, account="alice"):
     assert r.status_code == 200
     csrf = http.cookies.get("lanhu_csrf")
     r = http.post("/login", data={"tx": tx, "csrf": csrf, "action": "allow", "account": account, "password": "test"})
-    assert r.status_code == 303, r.text
-    query = parse_qs(urlsplit(r.headers["location"]).query)
+    query = parse_qs(urlsplit(callback_destination(r)).query)
     assert query["state"] == ["original-state"]
     return query["code"][0], verifier
 
@@ -274,13 +283,13 @@ def test_csrf_rejection_and_explicit_denial(http, provider):
     )
     csrf = http.cookies.get("lanhu_csrf")
     r = http.post("/login", data={"tx": tx, "csrf": csrf, "action": "deny"})
-    assert r.status_code == 303
-    assert parse_qs(urlsplit(r.headers["location"]).query) == {"error": ["access_denied"], "state": ["deny-state"]}
+    assert parse_qs(urlsplit(callback_destination(r)).query) == {"error": ["access_denied"], "state": ["deny-state"]}
     assert provider.store.get("pending", tx) is None
 
 
 @pytest.mark.asyncio
-async def test_browser_form_preserves_origin(http, provider):
+@pytest.mark.parametrize("action", ["allow", "deny"])
+async def test_browser_form_preserves_origin(http, provider, action):
     import asyncio
     import threading
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -313,9 +322,14 @@ async def test_browser_form_preserves_origin(http, provider):
 
             class CallbackHandler(BaseHTTPRequestHandler):
                 def do_GET(self):
-                    self.send_response(200)
-                    self.end_headers()
-                    self.wfile.write(b"Returned to MCP client")
+                    if self.path.startswith("/callback"):
+                        self.send_response(302)
+                        self.send_header("Location", "http://localhost:19876/finished")
+                        self.end_headers()
+                    else:
+                        self.send_response(200)
+                        self.end_headers()
+                        self.wfile.write(b"Returned to MCP client")
 
                 def log_message(self, *args):
                     pass
@@ -345,13 +359,21 @@ async def test_browser_form_preserves_origin(http, provider):
 
             await page.route("**/login*", route_request)
             await page.goto(login_url)
-            await page.get_by_role("button", name="取消授权").click()
+            if action == "allow":
+                await page.locator('[name="account"]').fill("alice")
+                await page.locator('[name="password"]').fill("test")
+                await page.get_by_role("button", name="登录蓝湖并授权").click()
+            else:
+                await page.get_by_role("button", name="取消授权").click()
             headers, result = await asyncio.wait_for(submitted, timeout=10)
-            await page.wait_for_url("http://127.0.0.1:19876/callback*", timeout=5000)
+            await page.wait_for_url("http://localhost:19876/finished", timeout=5000)
             assert headers["origin"] == provider.public_url
             assert "lanhu_csrf=" in headers["cookie"]
-            assert result.status_code == 303, result.text
-            assert parse_qs(urlsplit(result.headers["location"]).query)["error"] == ["access_denied"]
+            query = parse_qs(urlsplit(callback_destination(result)).query)
+            if action == "allow":
+                assert provider.store.get("code", query["code"][0])
+            else:
+                assert query["error"] == ["access_denied"]
         finally:
             await browser.close()
             if "callback_server" in locals():

@@ -168,11 +168,6 @@ class LanhuOAuthProvider(OAuthProvider):
         pending = self.store.get("pending", tx) or {}
         callback_uri = str(pending.get("params", {}).get("redirect_uri", ""))
         redirect = html.escape(callback_uri[:300])
-        callback = urlsplit(callback_uri)
-        # Chromium applies form-action to redirects too, including the OAuth callback.
-        # This URI was already validated against the registered client's redirects.
-        callback_source = f"{callback.scheme}://{callback.netloc}"
-        form_action = f"'self' {callback_source}" if callback_uri else "'self'"
         body = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>授权连接蓝湖 MCP</title>
 <style>body{margin:0;background:#f4f6fb;color:#18213a;font:16px/1.6 system-ui,sans-serif}main{box-sizing:border-box;max-width:460px;margin:7vh auto;padding:36px;background:white;border:1px solid #e3e8f2;border-radius:20px;box-shadow:0 20px 60px #2333500a}small{color:#64718a}h1{font-size:26px;line-height:1.3}label{display:block;margin-top:18px}input{box-sizing:border-box;display:block;width:100%;padding:12px;border:1px solid #cdd5e4;border-radius:8px;font:inherit}button{width:100%;padding:13px;margin-top:24px;border:0;border-radius:8px;background:#2867ed;color:white;font:inherit;cursor:pointer}.error{color:#b3261e}code{overflow-wrap:anywhere;font-size:12px}p{margin:16px 0}.cancel{background:#edf1f7;color:#34435d;margin-top:10px}@media(max-width:500px){main{margin:20px 12px;padding:24px}}</style></head><body><main>
 <small>LANHU · MCP 授权</small><h1>连接你的蓝湖账号</h1><p><strong>CLIENT</strong> 请求使用你的蓝湖权限读取项目、需求与设计资源，并使用项目协作工具。</p><small>回调地址：<code>REDIRECT</code></small><p>仅能访问该蓝湖账号有权访问的数据。账号密码仅用于本次向蓝湖验证，不会保存；授权会话有效期为 7 天。</p><p class="error" role="alert">ERROR</p>
@@ -193,7 +188,7 @@ class LanhuOAuthProvider(OAuthProvider):
                 # no-referrer makes browsers serialize a same-origin POST's Origin as null.
                 # same-origin preserves the form's Origin without leaking tx to OAuth callbacks.
                 "Referrer-Policy": "same-origin",
-                "Content-Security-Policy": f"default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; frame-ancestors 'none'; base-uri 'none'",
+                "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
                 "X-Content-Type-Options": "nosniff",
             },
         )
@@ -207,6 +202,24 @@ class LanhuOAuthProvider(OAuthProvider):
             path="/login",
         )
         return response
+
+    def _return_to_client(self, destination):
+        # Commit a document before navigating: Chromium checks every HTTP redirect
+        # after a form POST against form-action, including client-owned redirects.
+        # The destination comes only from the validated authorization transaction.
+        escaped = html.escape(destination, quote=True)
+        return HTMLResponse(
+            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            f'<meta http-equiv="refresh" content="0;url={escaped}">'
+            '<title>返回 MCP 客户端</title></head><body><p>正在返回 MCP 客户端…</p>'
+            f'<a href="{escaped}" rel="noreferrer">点击返回客户端</a></body></html>',
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "Content-Security-Policy": "default-src 'none'; form-action 'none'; frame-ancestors 'none'; base-uri 'none'",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def login_page(self, request):
         if request.method == "POST":
@@ -240,8 +253,8 @@ class LanhuOAuthProvider(OAuthProvider):
         params = pending["params"]
         if form.get("action") == "deny":
             self.store.get("pending", tx, consume=True)
-            return RedirectResponse(
-                redirect_with(params["redirect_uri"], error="access_denied", state=params["state"]), status_code=303
+            return self._return_to_client(
+                redirect_with(params["redirect_uri"], error="access_denied", state=params["state"])
             )
         # Bound failed login attempts per authorization transaction and remote IP.
         remote = request.client.host if request.client else "unknown"
@@ -272,6 +285,6 @@ class LanhuOAuthProvider(OAuthProvider):
         )
         self.store.put("code", code, record, 120)
         self.store.delete("csrf", tx)
-        return RedirectResponse(
-            redirect_with(params["redirect_uri"], code=code, state=params["state"]), status_code=303
+        return self._return_to_client(
+            redirect_with(params["redirect_uri"], code=code, state=params["state"])
         )
